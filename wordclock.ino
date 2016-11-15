@@ -23,17 +23,26 @@ const byte LANGUAGE_EN = 2;
 const byte LDR_NUMBER_OF_LEVELS = 8;
 const byte LDR_CACHE_SIZE = 16;
 byte ldrCache[LDR_CACHE_SIZE];
-byte ldrDensityLevel = 0;
 
 // DCF77
 //time_t time;
 DCF77 dcf77 = DCF77(PIN_DCF77, INTERRUPT_DCF77);
 time_t previousTime = 0;
+const byte SLEEP_TIME_FROM_HOUR = 0;
+const byte SLEEP_TIME_TO_HOUR = 6;
 
 // LEDs
 const byte LED_NUMBER_OF_LEDS = 126;
 LPD8806 ledStrip = LPD8806(LED_NUMBER_OF_LEDS);
 
+// LED-COLOR (0 == red, 240 == blue)
+const word HUE_OFFSET = 240;
+uint32_t previousColor = 0;
+
+// Effect on start
+const boolean SHOW_RANDOM_EFFECT_ON_STARTUP = true;
+
+/// LED matrix
 word matrix[11];
 
 #define DE_X_ESIST       matrix[0] |= 0b1101110000000000
@@ -67,19 +76,26 @@ word matrix[11];
 #define DE_M_3           matrix[10] |= 0b0000000011110000
 #define DE_M_4           matrix[10] |= 0b0000000000001111
 
+// SLEEP
+boolean shouldSleep = false;
+
 // Set DEBUG mode on/off
-#define LOG_LEVEL LOG_LEVEL_DEBUG
+//#define LOG_LEVEL LOG_LEVEL_DEBUG
+#define LOG_LEVEL LOG_LEVEL_NOOUTPUT
 
 // Set test mode on/off
-const boolean IS_TEST_MODE  = true;
-const boolean IS_LDR_TEST   = false;
+const boolean IS_TEST_MODE = false;
+const boolean IS_LDR_TEST = false;
 const boolean IS_DCF77_TEST = false;
-const boolean IS_LED_TEST = true;
+const boolean IS_LED_TEST = false;
+const boolean IS_TIME_AND_COLOR_TEST = false;
+const boolean IS_COLOR_TEST = false;
+const boolean IS_HSB2RGB_TEST = false;
 
 
-/// <summary>
+///
 /// Initializes the DCF77, LDR and LEDs.
-/// </summary>
+///
 void setup()
 {
   // Initialize logging
@@ -94,7 +110,8 @@ void setup()
   digitalWrite(PIN_DCF77, HIGH);
 
   // Activate cache for LDR
-  initializeCache();
+  // TODO: Activate
+  // initializeCache();
 
   // Start up the LED strip
   ledStrip.begin();
@@ -103,6 +120,7 @@ void setup()
 
   // Activate DCF77 sensor
   dcf77.Start();
+  // Sync time every 300 seconds (5 minutes)
   setSyncInterval(30);
   setSyncProvider(getDCF77Time);
 
@@ -119,42 +137,81 @@ void setup()
   else
   {  
     byte effectIdentifier = random(0, 4);
+    unsigned long startMillis = millis();
     // Wait until the SyncProvider sets the time
     while (!isTimeSet()) 
     { 
-      Log.Debug(".");
-      renderEffect(effectIdentifier);
+      if (SHOW_RANDOM_EFFECT_ON_STARTUP)
+      {
+        unsigned long currentMillis = millis();
+        unsigned int elapsedSeconds = (currentMillis - startMillis) / 1000;
+        Log.Debug("Time elapsed: %d seconds"CR, elapsedSeconds);
+        renderEffect(effectIdentifier);
+      }
+      else
+      {
+        Log.Debug(".");
+        delay(2000);
+      }
+
     }
     Log.Debug(CR);
   }
 }
 
+///
+/// Runs forever. :)
+///
 void loop()
 {
   if (IS_TEST_MODE)
   {
     // LDR
     if (IS_LDR_TEST)
-      testHandleLDR();
+      testLDR();
     // DCF77
     if (IS_DCF77_TEST)
-      testHandleDCF77();
+      testDCF77();
     // LEDs
     if (IS_LED_TEST)
-      testHandleLEDs();
+      testLEDs();
+    // TIME & COLOR
+    if (IS_TIME_AND_COLOR_TEST)
+      testGetDayOfYear();
+    // COLOR
+    if (IS_COLOR_TEST)
+      testColors();
+    // HSB2RGB
+    if (IS_HSB2RGB_TEST)
+      testHSB2RGB();
   }
   else
   {
     time_t time = now();
+    uint32_t color = getColor(time);
 
     // Sleep from 00:00 to 06:00 o'clock or when the time did not change at all
-    if (isSleepTime(time) || !hasTimeChanged(time))
+    if (isSleepTime(time))
     {
-      delay(500);
-      return;
+      if (!shouldSleep)
+      {
+        shouldSleep = true;
+        fallAsleep();
+        // Delay for 30 seconds
+        delay(30000);
+      }
     }
-    //handleLDR();
-    handleLEDs();
+    else if (hasTimeChanged(time) || hasColorChanged(color))
+    {
+      shouldSleep = false;
+      uint32_t color = getColor(time);
+      renderTimeAndColor(time, color);
+    }
+    else
+    {
+      delay(50);
+      Log.Debug("Neither time nor color changed. Nothing to do. :)"CR);
+    }
   }
 }
 
@@ -163,15 +220,6 @@ void loop()
 // -------------------------
 // DCF-77
 // -------------------------
-
-void testHandleDCF77()
-{
-  time_t time = now();
-  if (time == previousTime)
-    return;
-  previousTime = time;
-  logTimeAndDate();
-}
 
 unsigned long getDCF77Time()
 { 
@@ -189,7 +237,7 @@ boolean isTimeSet()
 boolean isSleepTime(time_t time)
 {
   byte currentHour = hour(time);
-  return currentHour >= 0 && currentHour < 6;
+  return currentHour >= SLEEP_TIME_FROM_HOUR && currentHour < SLEEP_TIME_TO_HOUR;
 }
 
 boolean hasTimeChanged(time_t time)
@@ -200,7 +248,7 @@ boolean hasTimeChanged(time_t time)
     return true;
   }
   if (IS_TEST_MODE && IS_DCF77_TEST && previousTime != 0)
-    Log.Debug("Time did not change, nothing to do");
+    Log.Debug("Time did not change, nothing to do.");
   return false;
 }
 
@@ -233,79 +281,36 @@ void logDigits(int digits)
 // LED
 // -------------------------
 
-void testHandleLEDs()
-{
-  int h = 0;
-  for (int m = 0; m < 60; m++)
-  {
-    clearBuffer();
-    setTime(LANGUAGE_DE_SW, h, m);
-    for (byte i = 0; i < 11; i++)
-      render(i, matrix[i]);
-    ledStrip.show();
-    Log.Debug("%d:%d"CR, h, m); 
-    delay(250);
-    if (m == 59)
-    {
-      m = -1;
-      if (h == 23)
-        h = 0;
-      else
-        h++;
-    }  
-  }
-
-  clearBuffer();
-  setTime(LANGUAGE_DE_SW, 10, 9);
-  render();
-  ledStrip.show();
-  delay(3000);
-  clearBuffer();
-
-  /*
-  setTime(LANGUAGE_DE_SW, 7, 5);
-   render();
-   ledStrip.show();
-   delay(3000);  
-   clearBuffer();
-   
-   setTime(LANGUAGE_DE_SW, 7, 10);
-   render();
-   ledStrip.show();
-   delay(3000);  
-   clearBuffer();
-   
-   setTime(LANGUAGE_DE_SW, 7, 20);
-   render();
-   ledStrip.show();
-   delay(3000);
-   clearBuffer();
-   */
-}
-
-void handleLEDs()
+void fallAsleep()
 {
   clearBuffer();
-  setTime(LANGUAGE_DE_SW, hour(), minute());
-  render();
+  renderColor(0);
   ledStrip.show();
 }
 
-void render()
+void renderTimeAndColor(time_t time, uint32_t color)
+{
+  clearBuffer();
+  setTime(LANGUAGE_DE_SW, hour(time), minute(time));
+  renderColor(color);
+  ledStrip.show();
+}
+
+void renderColor(uint32_t color)
 {
   for (byte i = 0; i < 11; i++)
-    render(i, matrix[i]);
+    renderRow(i, matrix[i], color);
 }
 
-void render(byte rowIdx, word data)
+void renderRow(byte rowIdx, word data, uint32_t color)
 {
   // Row 10 contains special bitmasks for the edge LEDs
   if (rowIdx == 10) 
   {  
-    renderPixel(123, data & 0b1111000000000000);
-    renderPixel(121, data & 0b0000111100000000);
-    renderPixel(119, data & 0b0000000011110000);
-    renderPixel(125, data & 0b0000000000001111);
+    renderPixel(123, data & 0b1111000000000000, color);
+    renderPixel(121, data & 0b0000111100000000, color);
+    renderPixel(119, data & 0b0000000011110000, color);
+    renderPixel(125, data & 0b0000000000001111, color);
   }
   else
   {
@@ -328,7 +333,7 @@ void render(byte rowIdx, word data)
       {
         word value = data & bitMask;
         ledIdx = (rowIdx * 12 - offset) + idx++;
-        renderPixel(ledIdx, value);
+        renderPixel(ledIdx, value, color);
       }
     }
     else
@@ -341,13 +346,13 @@ void render(byte rowIdx, word data)
         // Evil hack
         if (rowIdx == 1 && ledIdx == 10)
           continue;
-        renderPixel(ledIdx, value);
+        renderPixel(ledIdx, value, color);
       }
     }
   }
 }
 
-void renderPixel(byte pixelIdx, word value)
+void renderPixel(byte pixelIdx, word value, uint32_t color)
 {
   if (pixelIdx < 0 || pixelIdx > LED_NUMBER_OF_LEDS - 1)
   {
@@ -355,11 +360,11 @@ void renderPixel(byte pixelIdx, word value)
     return;
   }
   if (value){
-    Log.Debug("Activate %d"CR, pixelIdx);
-    ledStrip.setPixelColor(pixelIdx, 0, 0, 64);
+    //Log.Debug("Activate %d"CR, pixelIdx);
+    ledStrip.setPixelColor(pixelIdx, color);
   }
   else{
-        Log.Debug("Deactivate %d"CR, pixelIdx);
+    //Log.Debug("Deactivate %d"CR, pixelIdx);
     ledStrip.setPixelColor(pixelIdx, 0);
   }
 }
@@ -430,8 +435,6 @@ void renderColorChase(uint32_t c, uint8_t wait) {
   // Then display one pixel at a time
   for (int i = 0; i < ledStrip.numPixels(); i++) 
   {
-    if (isTimeSet())
-      return;
     // Ignore non-visible LEDs and corner LEDs
     if (isPixelToIgnore(i))
       continue;
@@ -762,7 +765,8 @@ void setMinutes(byte language, byte minutes)
 void setCorners(byte minutes) 
 {
   Log.Debug("%d minutes"CR, minutes % 5);
-  switch (minutes % 5) {
+  switch (minutes % 5)
+  {
   case 0:
     break;
   case 1:
@@ -794,31 +798,7 @@ void setCorners(byte minutes)
 // LDR
 // -------------------------
 
-void testHandleLDR()
-{
-  Log.Debug(CR);
-  // Read the value from the LDR
-  byte sensorValue = map((int)random(0, 1023), 0, 1024, 0, LDR_NUMBER_OF_LEVELS);
-  Log.Debug("Sensor value: %d"CR, sensorValue);
-  delay(1000);
-
-  // Push it to the stack
-  addToCache(sensorValue);
-  delay(1000);
-
-  Log.Debug("Cache content: ");
-  for (word i = 0; i < LDR_CACHE_SIZE; i++)
-    Log.Debug(" %d", ldrCache[i]);
-  Log.Debug(CR);
-
-  // Get the average density
-  byte averageDensityValue = getAverageDensityValue();
-  Log.Debug("Average density value: %d"CR, averageDensityValue);
-
-  delay(1000);
-}
-
-void handleLDR()
+byte getDensityFromLDR()
 {
   // Read the value from the LDR
   int sensorValue = analogRead(PIN_DCF77);
@@ -826,7 +806,7 @@ void handleLDR()
   // Push it to the stack
   addToCache(mappedSensorValue);
   // Get the average density
-  ldrDensityLevel = getAverageDensityValue();
+  return getAverageDensityValue();
 }
 
 void initializeCache()
@@ -865,4 +845,290 @@ byte getAverageDensityValue()
   }
   return (byte) (sum / LDR_CACHE_SIZE);
 }
+
+/*
+ * Gets the day of the year (supports leap years).
+ */
+word getDayOfYear(word year, word month, word day)
+{  
+  // Number of days at the beginning of the month in a non-leap year
+  word days[] = 
+  { 
+    0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 
+  };    
+  // The conditions to have a leap year
+  if (month > 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
+    return days[month - 1] + day + 1;
+  else
+    return days[month - 1] + day;  
+}
+
+uint8_t getR(uint32_t color)
+{
+  return ((uint8_t) (color >> 8) | 0x80);  
+}
+
+uint8_t getG(uint32_t color)
+{
+  return ((uint8_t) (color >> 16) | 0x80);  
+}
+
+uint8_t getB(uint32_t color)
+{
+  return ((uint8_t) (color | 0x80));  
+}
+
+uint32_t getRGB(uint32_t r, uint32_t g, uint32_t b)
+{
+  return ((uint32_t) (r | 0x80) << 8) | ((uint32_t) (g | 0x80) << 16) | (b | 0x80);
+}
+
+boolean hasColorChanged(uint32_t color)
+{
+  if (color != previousColor)
+  {
+    previousColor = color;
+    return true;
+  }
+  Log.Debug("Color did not change, nothing to do.");
+  return false;
+}
+
+uint32_t getColor(time_t currentTime)
+{
+  byte densityValue = getDensityFromLDR();
+  int currentYear = year(currentTime);  
+  int currentMonth = month(currentTime);
+  int currentDay = day(currentTime);
+  word dayOfYear = getDayOfYear(currentYear, currentMonth, currentDay);
+
+  word hue = map(dayOfYear, 1, 366, 0, 360);
+  float saturation = 1.0;
+  float brightness = (float) map(densityValue, 0, 10, 0, LDR_NUMBER_OF_LEVELS)/10;
+
+  return HSB2RGB(hue, saturation, brightness);
+}
+
+uint32_t HSB2RGB(word hue, float saturation, float brightness)
+{ 
+  // Apply the offset. 
+  // If set to 0, the first color is red. 
+  // If set to 240, the first color is blue.
+  hue = (hue + HUE_OFFSET) % 360;
+  saturation = constrain(saturation, 0.0, 1.0);
+  brightness = constrain(brightness, 0.0, 1.0);
+
+  byte h =  (byte)floor(hue / 60.0);
+  float f = hue / 60.0 - h;
+  float p = brightness * (1.0 - saturation);
+  float q = brightness * (1.0 - saturation * f);
+  float t = brightness * (1.0 - saturation * (1.0 - f));
+
+  float r, g, b;
+
+  if (h == 0 || h == 6)
+  {
+    r = brightness;
+    g = t;
+    b = p;
+  }
+  else if (h == 1)
+  {
+    r = q;
+    g = brightness;
+    b = p;
+  }
+  else if (h == 2)
+  {
+    r = p;
+    g = brightness;
+    b = t;
+  }
+  else if (h == 3)
+  {
+    r = p;
+    g = q;
+    b = brightness;
+  }
+  else if (h == 4)
+  {
+    r = t;
+    g = p;
+    b = brightness;
+  }
+  else if (h == 5)
+  {
+    r = brightness;
+    g = p;
+    b = q;    
+  }
+  else
+  {
+    r = 1.0;
+    g = 0.0;
+    b = 0.0;
+  }
+
+  return getRGB(r*255, g*255, b*255);
+}
+
+
+
+// -------------------------
+// Tests
+// -------------------------
+
+void testDCF77()
+{
+  time_t time = now();
+  if (time == previousTime)
+    return;
+  previousTime = time;
+  logTimeAndDate();
+}
+
+void testLEDs()
+{
+  int h = 0;
+  for (int m = 0; m < 60; m++)
+  {
+    clearBuffer();
+    setTime(LANGUAGE_DE_SW, h, m);
+    for (byte i = 0; i < 11; i++)
+      renderRow(i, matrix[i], 32);
+    ledStrip.show();
+    Log.Debug("%d:%d"CR, h, m); 
+    delay(250);
+    if (m == 59)
+    {
+      m = -1;
+      if (h == 23)
+        h = 0;
+      else
+        h++;
+    }  
+  }
+
+  /*
+  clearBuffer();
+   setTime(LANGUAGE_DE_SW, 10, 9);
+   render();
+   ledStrip.show();
+   delay(3000);
+   clearBuffer();
+   
+   setTime(LANGUAGE_DE_SW, 7, 5);
+   render();
+   ledStrip.show();
+   delay(3000);  
+   clearBuffer();
+   
+   setTime(LANGUAGE_DE_SW, 7, 10);
+   render();
+   ledStrip.show();
+   delay(3000);  
+   clearBuffer();
+   
+   setTime(LANGUAGE_DE_SW, 7, 20);
+   render();
+   ledStrip.show();
+   delay(3000);
+   clearBuffer();
+   */
+}
+
+void testLDR()
+{
+  Log.Debug(CR);
+  // Read the value from the LDR
+  byte sensorValue = map((int)random(0, 1023), 0, 1024, 0, LDR_NUMBER_OF_LEVELS);
+  Log.Debug("Sensor value: %d"CR, sensorValue);
+  delay(100);
+
+  // Push it to the stack
+  addToCache(sensorValue);
+  delay(100);
+
+  Log.Debug("Cache content: ");
+  for (word i = 0; i < LDR_CACHE_SIZE; i++)
+    Log.Debug(" %d", ldrCache[i]);
+  Log.Debug(CR);
+
+  // Get the average density
+  byte averageDensityValue = getAverageDensityValue();
+  Log.Debug("Average density value: %d"CR, averageDensityValue);
+
+  delay(100);
+}
+
+void testColors()
+{
+  float saturation = 1.0;
+  float brightness = 1.0;
+  for (word hue = 0; hue < 360; hue+=10)
+  {
+    uint32_t rgb = HSB2RGB(hue, saturation, brightness);
+    Log.Debug("RGB color -> R-G-B (RGB): -> %d-%d-%d (%l)"CR, getR(rgb), getG(rgb), getB(rgb), (unsigned long)rgb);
+    renderColorWipe(rgb, 5);
+  }  
+  clearBuffer();
+}
+
+void testGetDayOfYear()
+{
+  for (word y = 2014; y < 2017; y++)
+  {
+    for (byte m = 1; m <= 12; m++)
+    {      
+      if ((m % 2 == 1 && m < 8) || (m % 2 == 0 && m >= 8))
+      {
+        for (byte d = 1; d <= 31; d++)
+        {          
+          Log.Debug("Date: %d.%d.%d"CR, d, m, y);
+          Log.Debug("Day of year: %d"CR, getDayOfYear(y, m, d));
+          delay(50);
+        }
+      }      
+      else if ((m % 2 == 0 && m < 8) || (m % 2 == 1 && m >= 8))
+      {
+        for (byte d = 1; d <= 30; d++)
+        {          
+          Log.Debug("Date: %d.%d.%d"CR, d, m, y);
+          Log.Debug("Day of year: %d"CR, getDayOfYear(y, m, d));
+          delay(50);
+        }
+      }      
+      else
+      {
+        for (byte d = 1; d <= 28; d++)
+        {          
+          Log.Debug("Date: %d.%d.%d"CR, d, m, y);
+          Log.Debug("Day of year: %d"CR, getDayOfYear(y, m, d));
+          delay(50);
+        } 
+      }
+    }
+  }
+}
+
+void testHSB2RGB()
+{
+  // We want full saturation all the time.
+  float saturation = 1.0;
+  // Simulate all hue values
+  for (word hue = 0; hue < 360; hue++)
+  {
+    // Simulate all brightness values
+    for (float brightness = 0.0; brightness < 1.0; brightness+=0.1)
+    {
+      uint32_t rgb = HSB2RGB(hue, saturation, brightness);
+      Log.Debug("RGB color -> R-G-B (RGB): -> %d-%d-%d (%l)"CR, getR(rgb), getG(rgb), getB(rgb), (long)rgb);
+      delay(50);
+    };
+  }
+}
+
+
+
+
 
