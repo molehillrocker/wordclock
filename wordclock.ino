@@ -122,7 +122,7 @@ void setup()
 
   // Activate DCF77 sensor
   dcf77.Start();
-  // Sync time every 300 seconds (5 minutes)
+  // Sync time every 30 seconds
   setSyncInterval(30);
   setSyncProvider(getDCF77Time);
 
