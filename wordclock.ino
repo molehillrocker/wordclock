@@ -153,9 +153,7 @@ void setup()
       else
       {
         Log.Debug(".");
-        delay(2000);
       }
-
     }
     Log.Debug(CR);
   }
@@ -211,7 +209,6 @@ void loop()
     }
     else
     {
-      delay(50);
       Log.Debug("Neither time nor color changed. Nothing to do. :)"CR);
     }
   }
