@@ -1,7 +1,9 @@
-#include <Time.h>
 #include <SPI.h>
-#include <DCF77.h>
+
 #include <Logging.h>
+#include <DCF77.h>
+#include <Time.h>
+#include <TimeLib.h>
 #include <LPD8806.h>
 
 
